@@ -8,6 +8,8 @@ import android.location.LocationListener
 import android.location.LocationManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
@@ -19,14 +21,9 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
-import kotlin.math.*
 
 @RequiresApi(Build.VERSION_CODES.Q)
-class StrideCalibrationActivity : AppCompatActivity(), SensorEventListener, LocationListener {
-
-    companion object {
-        private const val STRIDE_DISTANCE_METERS = 5.0f // 참고용, GPS 거리 사용
-    }
+class StrideCalibrationActivity : AppCompatActivity(), SensorEventListener {
 
     private lateinit var tvStepCount: TextView
     private lateinit var tvResult: TextView
@@ -43,6 +40,7 @@ class StrideCalibrationActivity : AppCompatActivity(), SensorEventListener, Loca
     private var startLocation: Location? = null
     private var endLocation: Location? = null
     private var isMeasuring = false
+    private var currentSteps: Int? = null
 
     private val locationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -95,7 +93,6 @@ class StrideCalibrationActivity : AppCompatActivity(), SensorEventListener, Loca
         }
     }
 
-    // 위치 권한 체크 및 요청
     private fun checkLocationPermission(): Boolean {
         return ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
     }
@@ -105,91 +102,109 @@ class StrideCalibrationActivity : AppCompatActivity(), SensorEventListener, Loca
         )
     }
 
-    // 보정 시작
+    // 위치를 한 번만 받아오는 함수 (타임아웃 포함)
+    private fun requestSingleLocation(callback: (Location?) -> Unit) {
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            Toast.makeText(this, "위치 권한이 없습니다.", Toast.LENGTH_SHORT).show()
+            callback(null)
+            return
+        }
+        tvStepCount.text = "GPS 위치를 찾는 중입니다...\n(실외에서 측정해 주세요)"
+        var isCalled = false
+        val listener = object : LocationListener {
+            override fun onLocationChanged(location: Location) {
+                if (!isCalled) {
+                    isCalled = true
+                    callback(location)
+                    locationManager.removeUpdates(this)
+                }
+            }
+            override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+            override fun onProviderEnabled(provider: String) {}
+            override fun onProviderDisabled(provider: String) {
+                if (!isCalled) {
+                    isCalled = true
+                    Toast.makeText(this@StrideCalibrationActivity, "GPS가 꺼져 있습니다.", Toast.LENGTH_SHORT).show()
+                    callback(null)
+                    locationManager.removeUpdates(this)
+                }
+            }
+        }
+        try {
+            locationManager.requestSingleUpdate(LocationManager.GPS_PROVIDER, listener, Looper.getMainLooper())
+        } catch (e: Exception) {
+            // 일부 기기에서 requestSingleUpdate가 deprecated일 수 있어 fallback
+            locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 0L, 0f, listener)
+        }
+        // 타임아웃: 안내만, 상태 유지
+        Handler(Looper.getMainLooper()).postDelayed({
+            if (!isCalled) {
+                isCalled = true
+                locationManager.removeUpdates(listener)
+                Toast.makeText(this, "GPS 위치를 아직 찾지 못했습니다. 움직이지 말고 기다려 주세요.", Toast.LENGTH_LONG).show()
+                tvStepCount.text = "GPS 위치를 아직 찾지 못했습니다. 움직이지 말고 기다려 주세요."
+                callback(null)
+            }
+        }, 30000L)
+    }
+
+    // 보정 시작: 모든 값 초기화 후 현재 걸음수와 최신 GPS 위치를 저장
     private fun startCalibration() {
+        // 모든 값 초기화
         startSteps = null
+        endSteps = null
         startLocation = null
+        endLocation = null
         isMeasuring = true
         tvResult.text = ""
-        tvStepCount.text = "걸음 수 측정 중..."
+        tvStepCount.text = ""
         btnStart.isEnabled = false
         btnFinish.isEnabled = false
 
-        // 현재 걸음 수 저장
-        startSteps = currentSteps
-
-        // 위치 업데이트 요청
         requestSingleLocation { location ->
-            startLocation = location
-            tvStepCount.text = "시작 걸음 수: ${startSteps ?: "측정 불가"}\n시작 위치: ${location.latitude}, ${location.longitude}"
-            btnFinish.isEnabled = true
+            if (location != null) {
+                startLocation = location
+                startSteps = currentSteps
+                tvStepCount.text = "시작 걸음 수: ${startSteps ?: "측정 불가"}\n시작 위치: ${location.latitude}, ${location.longitude}"
+                btnFinish.isEnabled = true
+            }
+            // 위치 못 찾으면 안내 문구 유지(상태 유지)
         }
     }
 
-    // 보정 완료
+    // 보정 완료: 현재 걸음수와 최신 GPS 위치를 저장, 보폭 계산
     private fun finishCalibration() {
         endSteps = null
         endLocation = null
         isMeasuring = false
         btnFinish.isEnabled = false
 
-        // 현재 걸음 수 저장
-        endSteps = currentSteps
-
-        // 위치 업데이트 요청
         requestSingleLocation { location ->
-            endLocation = location
-            val stepDelta = if (startSteps != null && endSteps != null) endSteps!! - startSteps!! else null
-            val gpsDistance = if (startLocation != null && endLocation != null) {
-                startLocation!!.distanceTo(endLocation!!)
-            } else null
+            if (location != null) {
+                endLocation = location
+                endSteps = currentSteps
+                val stepDelta = if (startSteps != null && endSteps != null) endSteps!! - startSteps!! else null
+                val gpsDistance = if (startLocation != null && endLocation != null) {
+                    startLocation!!.distanceTo(endLocation!!)
+                } else null
 
-            if (stepDelta != null && gpsDistance != null && stepDelta > 0) {
-                val stride = gpsDistance / stepDelta
-                tvResult.text = "걸음 수 차이: $stepDelta\nGPS 거리: ${"%.2f".format(gpsDistance)} m\n보폭: ${"%.2f".format(stride)} m/걸음"
+                if (stepDelta != null && gpsDistance != null && stepDelta > 0) {
+                    val stride = gpsDistance / stepDelta
+                    tvStepCount.text = ""
+                    tvResult.text = "걸음 수 차이: $stepDelta\nGPS 거리: ${"%.2f".format(gpsDistance)} m\n보폭: ${"%.2f".format(stride)} m/걸음"
+                } else {
+                    tvResult.text = "걸음 수 또는 위치 측정에 실패했습니다."
+                }
+                btnStart.isEnabled = true
             } else {
-                tvResult.text = "걸음 수 또는 위치 측정에 실패했습니다."
+                tvResult.text = ""
+                Toast.makeText(this, "GPS 위치를 아직 찾지 못했습니다. 움직이지 말고 기다려 주세요.", Toast.LENGTH_LONG).show()
+                tvStepCount.text = "GPS 위치를 아직 찾지 못했습니다. 움직이지 말고 기다려 주세요."
             }
-            btnStart.isEnabled = true
         }
     }
 
-    private fun requestSingleLocation(callback: (Location) -> Unit) {
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            // 권한 없을 때 처리
-            Toast.makeText(this@StrideCalibrationActivity, "위치 권한이 없습니다.", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        // 최근 위치가 있으면 바로 사용
-        val lastKnown = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
-            ?: locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
-        if (lastKnown != null) {
-            callback(lastKnown)
-            return
-        }
-
-        // 새 위치 요청
-        locationManager.requestSingleUpdate(LocationManager.GPS_PROVIDER, object : LocationListener {
-            override fun onLocationChanged(location: Location) {
-                callback(location)
-                locationManager.removeUpdates(this) // 위치 받은 후 업데이트 중지
-            }
-            override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
-            override fun onProviderEnabled(provider: String) {}
-            override fun onProviderDisabled(provider: String) {
-                Toast.makeText(
-                    this@StrideCalibrationActivity,
-                    "GPS가 꺼져 있습니다.",
-                    Toast.LENGTH_SHORT
-                ).show()
-            }
-        }, null)
-    }
-
-
-    // 만보기 센서
-    private var currentSteps: Int? = null
+    // 센서 콜백: 누적 걸음수 갱신
     override fun onSensorChanged(event: SensorEvent?) {
         if (event?.sensor?.type == Sensor.TYPE_STEP_COUNTER) {
             currentSteps = event.values[0].toInt()
@@ -210,10 +225,4 @@ class StrideCalibrationActivity : AppCompatActivity(), SensorEventListener, Loca
         super.onPause()
         sensorManager.unregisterListener(this)
     }
-
-    // LocationListener 구현(필수지만 여기선 사용 안 함)
-    override fun onLocationChanged(location: Location) {}
-    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
-    override fun onProviderEnabled(provider: String) {}
-    override fun onProviderDisabled(provider: String) {}
 }
